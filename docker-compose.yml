@@ -1,0 +1,14 @@
+services:
+  aiws:
+    build: .
+    ports:
+      - "127.0.0.1:7878:7878"   # change to "7878:7878" only behind TLS/VPN
+    environment:
+      AIWS_TOKEN: ${AIWS_TOKEN:?set AIWS_TOKEN to a long random secret}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - aiws-data:/data
+    restart: unless-stopped
+volumes:
+  aiws-data:
