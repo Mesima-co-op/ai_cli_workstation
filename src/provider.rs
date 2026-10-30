@@ -22,6 +22,16 @@ pub struct ProviderReq {
     pub system: Option<String>,
     pub messages: Vec<Msg>,
     pub max_tokens: u32,
+    /// Project scope (Claude Code only): working directory, extra readable folders, tool rules.
+    pub scope: Option<ScopeArgs>,
+}
+
+#[derive(Default, Clone)]
+pub struct ScopeArgs {
+    pub cwd: std::path::PathBuf,
+    pub add_dirs: Vec<std::path::PathBuf>,
+    pub deny: Vec<String>,
+    pub allow: Vec<String>,
 }
 
 pub struct ProviderOut {
@@ -82,7 +92,105 @@ pub fn build(name: &str, cfg: &ProviderCfg, http: &reqwest::Client) -> Result<Bo
         "claude-cli" => Ok(Box::new(ClaudeCli {
             command: if cfg.command.is_empty() { "claude".into() } else { cfg.command.clone() },
         })),
+        "jev" => {
+            let key = key.ok_or_else(|| anyhow!("no API key for provider '{name}': run `aiws key set {0}`", crate::config::env_label(&cfg.api_key_env)))?;
+            Ok(Box::new(JevOnly {
+                http: http.clone(),
+                base: trim(&cfg.base_url, "https://api.typesafe.ai"),
+                key,
+            }))
+        }
         other => bail!("unknown provider kind '{other}'"),
+    }
+}
+
+// ------------------------------------------------------------------ Jev only
+
+/// Jev is a decision model, not a chat model, so "chatting" with it means: the
+/// message is the `state`, and Jev answers yes/no questions about it. Lines that
+/// start with `?` are your questions; with none, a default analysis is run.
+struct JevOnly {
+    http: reqwest::Client,
+    base: String,
+    key: String,
+}
+
+
+#[async_trait]
+impl Provider for JevOnly {
+    async fn complete(&self, req: &ProviderReq, ctx: &Ctx) -> Result<ProviderOut> {
+        let text = req.messages.last().map(|m| m.content.as_str()).unwrap_or("");
+        let (mut state, mut asked): (Vec<&str>, Vec<(String, String)>) = (vec![], vec![]);
+        for line in text.lines() {
+            // Questions: a line starting with `?`, or `?? question` parts after the text (the TUI box is one line).
+            let mut parts = line.split("??");
+            let head = parts.next().unwrap_or("");
+            for q in parts.map(str::trim).filter(|q| !q.is_empty()) {
+                asked.push((format!("q{}", asked.len() + 1), q.to_string()));
+            }
+            match head.trim_start().strip_prefix('?') {
+                Some(q) if !q.trim().is_empty() => asked.push((format!("q{}", asked.len() + 1), q.trim().to_string())),
+                _ if !head.trim().is_empty() => state.push(head),
+                _ => {}
+            }
+        }
+        let mut state = state.join("\n").trim().to_string();
+        if state.is_empty() {
+            bail!("Jev needs some text to look at. Example: `Payment due 5 May, late fee 2% ?? Is there a deadline? ?? Is there a penalty?`");
+        }
+        let qs: Vec<(String, String)> = if asked.is_empty() {
+            // A plain message is itself the yes/no question. Jev judges it against the content in `state`:
+            // the earlier turns of this chat if there are any, otherwise the message itself.
+            let earlier: Vec<&str> = req.messages.iter().rev().skip(1).rev().map(|m| m.content.as_str()).collect();
+            if !earlier.is_empty() {
+                state = earlier.join("\n\n");
+            }
+            vec![("answer".to_string(), text.trim().to_string())]
+        } else {
+            asked
+        };
+        let questions: serde_json::Map<String, Value> =
+            qs.iter().map(|(id, q)| (id.clone(), json!({"type": "noul", "instructions": q}))).collect();
+        ctx.emit(StreamEvent::Status { text: format!("asking Jev {} question(s)", qs.len()) });
+        let model = if req.model.is_empty() { "jev-latest" } else { req.model.as_str() };
+        let resp = self
+            .http
+            .post(format!("{}/v1/systemone", self.base))
+            .bearer_auth(&self.key)
+            .json(&json!({"model": model, "state": state, "questions": questions}))
+            .send()
+            .await
+            .context("could not reach Jev")?;
+        let v = check(resp).await?;
+        let answers = v.get("answers").and_then(|a| a.as_object()).ok_or_else(|| anyhow!("Jev returned no answers: {}", clip(&v.to_string(), 300)))?;
+        let mut out = format!("Jev ({}) probability of yes:\n", v.get("model").and_then(|m| m.as_str()).unwrap_or(model));
+        for (id, q) in &qs {
+            let p = answers.get(id).and_then(|a| a.get("noul")).and_then(|n| n.as_f64());
+            match p {
+                Some(p) => {
+                    let filled = (p * 20.0).round() as usize;
+                    out.push_str(&format!(
+                        "  [{}{}] {:>3.0}%  {}  ({})\n",
+                        "#".repeat(filled),
+                        "-".repeat(20 - filled.min(20)),
+                        p * 100.0,
+                        if p >= 0.5 { "yes" } else { "no " },
+                        q
+                    ));
+                }
+                None => out.push_str(&format!("  (no answer for {id})\n")),
+            }
+        }
+        let usage = v.get("usage");
+        let n = |k: &str| usage.and_then(|u| u.get(k)).and_then(|x| x.as_u64());
+        Ok(ProviderOut {
+            text: out,
+            input_tokens: n("input_tokens").unwrap_or(0),
+            output_tokens: n("output_tokens").unwrap_or(0),
+            estimated: usage.is_none(),
+            reported_cost: None,
+            billing: "api",
+        })
     }
 }
 
@@ -512,6 +620,20 @@ impl Provider for ClaudeCli {
         }
         if let Some(s) = &req.system {
             cmd.arg("--append-system-prompt").arg(s);
+        }
+        if let Some(sc) = &req.scope {
+            cmd.current_dir(&sc.cwd);
+            for d in &sc.add_dirs {
+                cmd.arg("--add-dir").arg(d);
+            }
+            // Print mode cannot ask, so edits inside the project are pre-approved; the deny rules below still win.
+            cmd.arg("--permission-mode").arg("acceptEdits");
+            if !sc.allow.is_empty() {
+                cmd.arg("--allowedTools").args(&sc.allow);
+            }
+            if !sc.deny.is_empty() {
+                cmd.arg("--disallowedTools").args(&sc.deny);
+            }
         }
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

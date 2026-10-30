@@ -101,6 +101,8 @@ struct App {
     chat_max: Cell<usize>,
     chat_anchor: Cell<Option<usize>>,
     chat_provider: Option<String>,
+    /// None = the config's default project; Some("none") = no project.
+    chat_project: Option<String>,
     live_text: String,
     live_tools: Vec<String>,
     streamed: bool,
@@ -130,7 +132,7 @@ impl App {
             snap: None, snap_err: None, refreshing: false, last_refresh: Instant::now() - Duration::from_secs(60),
             sel_id: None, filter: String::new(), filtering: false, detail_scroll: 0,
             chat: Vec::new(), chat_input: String::new(), chat_pending: false,
-            chat_off: Cell::new(0), chat_max: Cell::new(0), chat_anchor: Cell::new(None), chat_provider: None,
+            chat_off: Cell::new(0), chat_max: Cell::new(0), chat_anchor: Cell::new(None), chat_provider: None, chat_project: None,
             live_text: String::new(), live_tools: Vec::new(), streamed: false, approval: None, chat_tasks: Vec::new(),
             roles: Vec::new(), key_state: Default::default(), key_edit: None, ui: theme::load(), set_sel: 0, set_edit: None, set_msg: None,
             cfg: None, items: Vec::new(), cfg_sel: 0, editing: None, cfg_msg: None,
@@ -365,6 +367,13 @@ impl App {
             }
             return;
         }
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            match k.code {
+                KeyCode::Char('t') => return self.toggle_mouse(),
+                KeyCode::Char('y') => return self.copy_last(),
+                _ => {}
+            }
+        }
         // Tab switching by function keys always works, even while typing.
         let fkey = match k.code {
             KeyCode::F(n @ 1..=6) => Some(TABS[(n - 1) as usize].0),
@@ -398,6 +407,99 @@ impl App {
                 Tab::Settings => self.key_settings(k),
                 _ => {}
             },
+        }
+    }
+
+    fn note(&mut self, text: impl Into<String>) {
+        self.chat.push(ChatLine { role: "note".into(), text: text.into(), meta: None, tools: vec![] });
+        self.chat_off.set(0);
+    }
+
+    fn toggle_mouse(&mut self) {
+        self.ui.mouse = !self.ui.mouse;
+        let _ = if self.ui.mouse {
+            crossterm::execute!(std::io::stdout(), EnableMouseCapture)
+        } else {
+            crossterm::execute!(std::io::stdout(), DisableMouseCapture)
+        };
+        let _ = theme::save(&self.ui);
+        self.note(if self.ui.mouse {
+            "Mouse wheel scrolling ON (select text by holding Shift while dragging)."
+        } else {
+            "Mouse wheel OFF: you can now select and copy text with the mouse. Ctrl+T turns scrolling back on."
+        });
+    }
+
+    /// Copy the last assistant answer to the system clipboard.
+    fn copy_last(&mut self) {
+        let Some(text) = self.chat.iter().rev().find(|l| l.role == "assistant").map(|l| l.text.clone()) else {
+            return self.note("Nothing to copy yet.");
+        };
+        match clipboard(&text) {
+            Ok(_) => self.note(format!("Copied the last answer ({} chars) to the clipboard.", text.chars().count())),
+            Err(e) => self.note(format!("Could not copy: {e}")),
+        }
+    }
+
+    /// Chat commands: a message starting with `/`.
+    fn slash(&mut self, text: &str) {
+        let mut parts = text.trim_start_matches('/').splitn(3, char::is_whitespace);
+        let cmd = parts.next().unwrap_or("").to_lowercase();
+        let a = parts.next().unwrap_or("").trim().to_string();
+        let b = parts.next().unwrap_or("").trim().to_string();
+        match cmd.as_str() {
+            "help" | "?" | "" => self.note(
+                "Commands:\n  /help               this list\n  /clear              clear the chat\n  /copy               copy the last answer (also Ctrl+Y)\n  /mouse              toggle mouse scrolling vs. text selection (also Ctrl+T)\n  /provider <name>    pick a provider, or /provider auto\n  /tab <name>         go to a tab (dashboard, requests, config, settings, help)\n  /project [name|off] show or pick the project scope (folders, branch, safety rules)\n  /set <key> <value>  change a setting, e.g. /set jev.enabled true\n  /quit               leave aiws",
+            ),
+            "clear" => {
+                self.chat.clear();
+                self.chat_off.set(0);
+            }
+            "copy" => self.copy_last(),
+            "mouse" => self.toggle_mouse(),
+            "quit" | "exit" => self.quit = true,
+            "provider" => {
+                let names: Vec<String> = self.cfg.as_ref().map(|c| c.providers.keys().cloned().collect()).unwrap_or_default();
+                if a.is_empty() || a == "auto" {
+                    self.chat_provider = None;
+                    self.note("Provider: automatic (pipeline/router/default).");
+                } else if names.contains(&a) {
+                    self.note(format!("Provider: {a}"));
+                    self.chat_provider = Some(a);
+                } else {
+                    self.note(format!("Unknown provider '{a}'. Available: {}", names.join(", ")));
+                }
+            }
+            "tab" => match TABS.iter().find(|(_, l)| l.to_lowercase().contains(&a.to_lowercase())) {
+                Some((t, _)) if !a.is_empty() => self.go(*t),
+                _ => self.note("Usage: /tab dashboard|requests|chat|config|settings|help"),
+            },
+            "project" => {
+                let names: Vec<String> = self.cfg.as_ref().map(|c| c.projects.keys().cloned().collect()).unwrap_or_default();
+                if a.is_empty() {
+                    let cur = match (&self.chat_project, self.cfg.as_ref().map(|c| c.default_project.clone())) {
+                        (Some(p), _) if p != "none" => p.clone(),
+                        (Some(_), _) => "none".into(),
+                        (None, Some(d)) if !d.is_empty() => format!("{d} (default)"),
+                        _ => "none".into(),
+                    };
+                    self.note(format!("Project: {cur}. Available: {}. Use /project <name> or /project off. Add one with `aiws project add`.", if names.is_empty() { "(none)".into() } else { names.join(", ") }));
+                } else if a == "off" || a == "none" {
+                    self.chat_project = Some("none".into());
+                    self.note("Project scope off for this chat.");
+                } else if names.contains(&a) {
+                    self.note(format!("Project: {a}. Claude works in its folders on a fresh branch; Hermes is not used to change files."));
+                    self.chat_project = Some(a);
+                } else {
+                    self.note(format!("Unknown project '{a}'. Available: {}", names.join(", ")));
+                }
+            }
+            "set" if !a.is_empty() && !b.is_empty() => {
+                self.apply(&a, &b);
+                self.note(format!("Setting {a}... (see the Config tab for the result)"));
+            }
+            "set" => self.note("Usage: /set <key> <value>   (list keys on the Config tab)"),
+            other => self.note(format!("Unknown command '/{other}'. Type /help.")),
         }
     }
 
@@ -483,7 +585,14 @@ impl App {
             }
             KeyCode::Enter => {
                 let text = self.chat_input.trim().to_string();
-                if text.is_empty() || self.chat_pending {
+                if text.is_empty() {
+                    return;
+                }
+                if text.starts_with('/') {
+                    self.chat_input.clear();
+                    return self.slash(&text);
+                }
+                if self.chat_pending {
                     return;
                 }
                 self.chat_input.clear();
@@ -493,10 +602,11 @@ impl App {
                 let messages: Vec<Msg> = self
                     .chat
                     .iter()
-                    .filter(|l| l.role != "error")
+                    .filter(|l| l.role != "error" && l.role != "note")
                     .map(|l| Msg { role: l.role.clone(), content: l.text.clone() })
                     .collect();
                 let provider = self.chat_provider.clone();
+                let project = self.chat_project.clone();
                 let (stx, mut srx) = tokio::sync::mpsc::unbounded_channel();
                 let (src, tx) = (self.src.clone(), self.tx.clone());
                 let fwd = self.handle.spawn(async move {
@@ -507,7 +617,7 @@ impl App {
                     }
                 });
                 let run = self.handle.spawn(async move {
-                    let req = ChatRequest { messages, provider, source: Some("tui".into()), ..Default::default() };
+                    let req = ChatRequest { messages, provider, project, source: Some("tui".into()), ..Default::default() };
                     stream::drive(src.chat_stream(req, stx.clone()), stx).await;
                 });
                 self.chat_tasks = vec![fwd, run];
@@ -719,6 +829,42 @@ impl App {
     }
 }
 
+fn clipboard(text: &str) -> std::result::Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        // clip.exe reads UTF-16 when the input starts with a byte-order mark.
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let mut child = Command::new("clip").stdin(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+        child.stdin.take().ok_or("no stdin")?.write_all(&bytes).map_err(|e| e.to_string())?;
+        child.wait().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        // OSC 52: most modern terminals (and tmux/ssh sessions) copy this to the local clipboard.
+        use std::io::Write;
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in text.as_bytes().chunks(3) {
+            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        let mut so = std::io::stdout();
+        write!(so, "\x1b]52;c;{out}\x07").and_then(|_| so.flush()).map_err(|e| e.to_string())
+    }
+}
+
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     app.refresh();
     app.load_config();
@@ -819,7 +965,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         _ if app.filtering => "type to filter · Enter keep · Esc clear",
         Tab::Dashboard => "Tab/1-6 switch · r refresh · ? help · q quit",
         Tab::Requests => "↑↓ select · PgUp/PgDn scroll detail · / filter · Esc clear filter · g/G first/last · q quit",
-        Tab::Chat => "Enter send · Esc cancel · ↑↓/PgUp/PgDn/Home/End scroll · Ctrl+P provider · Ctrl+L clear · Tab switch tab · Ctrl+C quit",
+        Tab::Chat => "Enter send · Esc cancel · ↑↓/PgUp/PgDn/Home/End scroll · Ctrl+P provider · Ctrl+L clear · Ctrl+Y copy answer · Ctrl+T mouse/select · /help commands · Tab switch tab · Ctrl+C quit",
         Tab::Config if app.key_edit.is_some() => "type or paste the key · Enter save · Esc cancel",
         Tab::Config if app.editing.is_some() => "type new value · Enter save · Esc cancel",
         Tab::Config => "↑↓ select · Enter edit (booleans toggle) · s store a key (on api_key_env rows) · x remove stored key · r reload · q quit",
@@ -1016,7 +1162,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
     let mut blocks: Vec<Vec<Line>> = Vec::new();
     if app.chat.is_empty() {
         blocks.push(vec![Line::from(Span::styled(
-            "Type a message below and press Enter. Long answers scroll: arrows, PgUp, PgDn, Home, End or the mouse wheel. Ctrl+P switches provider (claude_code, hermes...).",
+            "Type a message below and press Enter. Long answers scroll: arrows, PgUp, PgDn, Home, End or the mouse wheel. Ctrl+P switches provider. Type /help for commands. Ctrl+Y copies the last answer; Ctrl+T frees the mouse for selecting text.",
             dim(),
         ))]);
     }
@@ -1024,6 +1170,7 @@ fn draw_chat(f: &mut Frame, app: &App, area: Rect) {
         let (label, style) = match m.role.as_str() {
             "user" => ("you", Style::new().fg(t.user).add_modifier(Modifier::BOLD)),
             "assistant" => ("ai", Style::new().fg(t.ai).add_modifier(Modifier::BOLD)),
+            "note" => ("aiws", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             _ => ("error", Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)),
         };
         let mut l = vec![Line::from(Span::styled(label, style))];

@@ -34,7 +34,7 @@ impl Default for UiPrefs {
             symbols: "unicode".into(),
             refresh_ms: 1500,
             show_hints: true,
-            mouse: true,
+            mouse: false,
         };
         apply_preset(&mut p, "default");
         p

@@ -17,9 +17,55 @@ pub struct Config {
     pub router: RouterCfg,
     pub pipeline: PipelineCfg,
     pub jev: JevCfg,
+    /// Project used by chats that do not name one. Empty = no project scope.
+    pub default_project: String,
+    pub projects: BTreeMap<String, ProjectCfg>,
     pub providers: BTreeMap<String, ProviderCfg>,
     /// Price per million tokens, keyed by model-name prefix (longest prefix wins).
     pub prices: BTreeMap<String, Price>,
+}
+
+/// A named work scope: where the AI may work and read, and what it must not do.
+/// Enforced for Claude Code; see src/project.rs.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ProjectCfg {
+    /// Folders the AI may change. The first is the working directory.
+    pub folders: Vec<String>,
+    /// Extra folders the AI may read for context but must not change.
+    pub context: Vec<String>,
+    /// Switch to a fresh branch before making changes (never work on main).
+    pub create_branch: bool,
+    pub branch_prefix: String,
+    /// Extra Claude tool rules to deny, e.g. "Bash(git tag:*)".
+    pub deny: Vec<String>,
+    /// Extra Claude tool rules to allow without asking, e.g. "Bash(cargo test:*)".
+    pub allow: Vec<String>,
+    /// File patterns that must never be read or edited, e.g. ".env*", "*.pem".
+    pub protect: Vec<String>,
+    /// What to do if a secret shows up in the changes: "block" or "warn".
+    pub on_secret: String,
+}
+
+impl Default for ProjectCfg {
+    fn default() -> Self {
+        Self {
+            folders: vec![],
+            context: vec![],
+            create_branch: true,
+            branch_prefix: "aiws/".into(),
+            deny: vec![],
+            allow: vec![
+                "Bash(git status:*)".into(),
+                "Bash(git diff:*)".into(),
+                "Bash(git log:*)".into(),
+                "Bash(git add:*)".into(),
+                "Bash(git commit:*)".into(),
+            ],
+            protect: vec![".env*".into(), "secrets.env".into(), "*.pem".into(), "*.key".into(), "id_rsa*".into()],
+            on_secret: "block".into(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -77,6 +123,8 @@ pub struct JevCfg {
     pub enabled: bool,
     pub base_url: String,
     pub path: String,
+    /// Model name or alias sent to Jev (for example "jev-latest").
+    pub model: String,
     pub api_key_env: String,
     /// "bearer" or "x-api-key"
     pub auth: String,
@@ -101,8 +149,9 @@ impl Default for JevCfg {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_url: String::new(),
-            path: "/v1/decide".into(),
+            base_url: "https://api.typesafe.ai".into(),
+            path: "/v1/systemone".into(),
+            model: "jev-latest".into(),
             api_key_env: "JEV_API_KEY".into(),
             auth: "bearer".into(),
             timeout_ms: 3000,
@@ -247,6 +296,17 @@ impl Default for Config {
                 ..Default::default()
             },
         );
+        providers.insert(
+            "jev".into(),
+            ProviderCfg {
+                kind: "jev".into(),
+                enabled: false,
+                base_url: "https://api.typesafe.ai".into(),
+                api_key_env: "JEV_API_KEY".into(),
+                default_model: "jev-latest".into(),
+                ..Default::default()
+            },
+        );
         Self {
             default_provider: "claude_code".into(),
             server: ServerCfg::default(),
@@ -255,6 +315,8 @@ impl Default for Config {
             router: RouterCfg::default(),
             pipeline: PipelineCfg::default(),
             jev: JevCfg::default(),
+            default_project: String::new(),
+            projects: BTreeMap::new(),
             providers,
             prices: BTreeMap::new(),
         }
@@ -267,9 +329,20 @@ impl Config {
             bail!("default_provider '{}' is not defined under [providers]", self.default_provider);
         }
         for (name, p) in &self.providers {
-            if !matches!(p.kind.as_str(), "anthropic" | "openai" | "claude-cli" | "hermes-api" | "hermes-runs" | "hermes-cli") {
-                bail!("providers.{name}.kind must be anthropic, openai, claude-cli, hermes-api, hermes-runs or hermes-cli (got '{}')", p.kind);
+            if !matches!(p.kind.as_str(), "anthropic" | "openai" | "claude-cli" | "hermes-api" | "hermes-runs" | "hermes-cli" | "jev") {
+                bail!("providers.{name}.kind must be anthropic, openai, claude-cli, hermes-api, hermes-runs, hermes-cli or jev (got '{}')", p.kind);
             }
+        }
+        for (name, p) in &self.projects {
+            if p.folders.is_empty() {
+                bail!("projects.{name}.folders needs at least one folder (the first is the working directory)");
+            }
+            if !matches!(p.on_secret.as_str(), "block" | "warn") {
+                bail!("projects.{name}.on_secret must be block or warn");
+            }
+        }
+        if !self.default_project.is_empty() && !self.projects.contains_key(&self.default_project) {
+            bail!("default_project '{}' is not defined under [projects]", self.default_project);
         }
         if self.server.bind.parse::<std::net::SocketAddr>().is_err() {
             bail!("server.bind '{}' must look like 127.0.0.1:7878", self.server.bind);

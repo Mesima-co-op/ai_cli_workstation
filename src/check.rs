@@ -156,6 +156,8 @@ pub fn any_ready(cfg: &Config, exclude: &[String]) -> Vec<String> {
     names
         .into_iter()
         .filter(|n| !exclude.contains(n))
+        // Jev only answers yes/no questions; never use it as a general fallback for chat.
+        .filter(|n| cfg.providers.get(*n).map(|p| p.kind != "jev").unwrap_or(false))
         .filter(|n| cfg.providers.get(*n).map(|p| provider_ready(p).is_ok()).unwrap_or(false))
         .cloned()
         .collect()

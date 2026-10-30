@@ -26,6 +26,9 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub source: Option<String>,
+    /// Project scope by name (from config `[projects]`); "none" turns the default project off.
+    #[serde(default)]
+    pub project: Option<String>,
     /// Daemon API only: reply as a Server-Sent-Events stream.
     #[serde(default)]
     pub stream: bool,
@@ -124,12 +127,23 @@ impl Engine {
         self.run(req, Some(sink)).await
     }
 
-    async fn run(&self, req: ChatRequest, sink: Option<Sink>) -> Result<ChatResponse> {
+    async fn run(&self, mut req: ChatRequest, sink: Option<Sink>) -> Result<ChatResponse> {
         let ctx = Ctx::new(sink, self.hub.clone());
         if req.messages.is_empty() {
             bail!("no messages");
         }
         let cfg = self.config();
+        // Settle the project once, here; planner and executor steps inherit the answer.
+        req.project = match req.project.take().as_deref() {
+            Some("none") | Some("") => None,
+            Some(n) => Some(n.to_string()),
+            None => Some(cfg.default_project.clone()).filter(|p| !p.is_empty()),
+        };
+        if let Some(n) = &req.project {
+            if !cfg.projects.contains_key(n) {
+                bail!("unknown project '{n}'. Defined: {}", cfg.projects.keys().cloned().collect::<Vec<_>>().join(", "));
+            }
+        }
         // An explicit provider always wins; otherwise the pipeline (if on) decides.
         if req.provider.is_none() && cfg.pipeline.enabled {
             return self.pipeline(req, ctx, &cfg).await;
@@ -314,16 +328,65 @@ impl Engine {
 
         // 2. budget + provider construction; failures are logged too
         let started = Instant::now();
+        let project = req.project.as_ref().and_then(|n| cfg.projects.get(n).map(|p| (n.clone(), p.clone())));
+        let mut guard_note = String::new();
         let result = async {
             self.check_budget(&cfg)?;
+            let mut system = req.system.clone();
+            let mut scope_args = None;
+            let mut scope = None;
+            if let Some((pname, pcfg_proj)) = &project {
+                match pcfg.kind.as_str() {
+                    // These run their own file tools somewhere aiws cannot restrict.
+                    "hermes-api" | "hermes-runs" | "hermes-cli" => bail!(
+                        "project '{pname}' is active and {provider_name} cannot be limited to its folders; use claude_code for work that changes files"
+                    ),
+                    "claude-cli" => {
+                        let prompt = req.messages.last().map(|m| m.content.as_str()).unwrap_or("");
+                        let s = crate::project::prepare(pname, pcfg_proj, prompt)?;
+                        for n in &s.notes {
+                            ctx.emit(StreamEvent::Status { text: format!("project {pname}: {n}") });
+                        }
+                        ctx.emit(StreamEvent::Status {
+                            text: format!("project {pname}: working in {} on {}", s.work.display(), s.branch.as_deref().unwrap_or("(no branch)")),
+                        });
+                        system = Some(format!("{}\n\n{}", system.unwrap_or_default(), s.prompt()).trim().to_string());
+                        scope_args = Some(provider::ScopeArgs {
+                            cwd: s.work.clone(),
+                            add_dirs: s.writable.iter().skip(1).chain(s.context.iter()).cloned().collect(),
+                            deny: s.deny.clone(),
+                            allow: s.allow.clone(),
+                        });
+                        guard_note = format!(" | project {pname}@{}", s.branch.as_deref().unwrap_or("-"));
+                        scope = Some(s);
+                    }
+                    _ => {} // API providers have no file access, so there is nothing to scope
+                }
+            }
             let p = provider::build(&provider_name, pcfg, &self.http)?;
-            p.complete(&ProviderReq {
-                model: model.clone(),
-                system: req.system.clone(),
-                messages: req.messages.clone(),
-                max_tokens: req.max_tokens.unwrap_or(4096),
-            }, &ctx)
-            .await
+            let out = p
+                .complete(&ProviderReq {
+                    model: model.clone(),
+                    system,
+                    messages: req.messages.clone(),
+                    max_tokens: req.max_tokens.unwrap_or(4096),
+                    scope: scope_args,
+                }, &ctx)
+                .await?;
+            if let Some(s) = scope {
+                let r = crate::project::finish(&s);
+                ctx.emit(StreamEvent::Status { text: format!("project {}: {} file(s) changed", s.name, r.changed) });
+                let mut problems: Vec<String> = r.findings.clone();
+                problems.extend(r.context_changed.iter().map(|d| format!("read-only folder was changed: {d}")));
+                if !problems.is_empty() {
+                    let list = problems.iter().map(|p| format!("  - {p}")).collect::<Vec<_>>().join("\n");
+                    if s.block_on_secret {
+                        bail!("project {}: the changes were left uncommitted on branch {} for you to review, and were not pushed:\n{list}\n(set projects.{}.on_secret = warn to only be warned)", s.name, s.branch.as_deref().unwrap_or("-"), s.name);
+                    }
+                    ctx.emit(StreamEvent::Status { text: format!("WARNING project {}:\n{list}", s.name) });
+                }
+            }
+            Ok::<_, anyhow::Error>(out)
         }
         .await;
         row.latency_ms = started.elapsed().as_millis() as u64;
@@ -341,6 +404,7 @@ impl Engine {
                 if !ctx.emitted_text() {
                     ctx.text(&out.text); // providers that return the answer in one piece
                 }
+                row.route_reason.push_str(&guard_note);
                 if out.estimated {
                     row.route_reason = format!("{} (tokens estimated)", row.route_reason);
                 }

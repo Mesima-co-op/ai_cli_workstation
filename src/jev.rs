@@ -1,11 +1,10 @@
 //! Request "verdicts": is this simple or complex, does it need a plan, is it risky?
 //!
 //! Two sources:
-//!   * Jev (TypeSafe AI), a typed-decision model. NOTE: Jev's API is not publicly
-//!     documented, so the request/response shape below is an *assumption* based on
-//!     the vendor's description ("state + typed questions in, choices/scores out").
-//!     Everything is configurable under [jev], parsing is lenient, and any failure
-//!     falls back to the heuristic, so a wrong guess never breaks a request.
+//!   * Jev (TypeSafe AI), a typed-decision model: POST /v1/systemone with
+//!     {model, state, questions}. The request follows the vendor's documented example;
+//!     the response shape is NOT documented in what we have, so parsing is lenient and
+//!     any failure (with the raw response in the note) falls back to the heuristic.
 //!   * A built-in heuristic (always available).
 
 use crate::config::{Config, JevCfg};
@@ -78,19 +77,21 @@ async fn ask(cfg: &Config, http: &reqwest::Client, system: Option<&str>, message
     let j = &cfg.jev;
     let key = crate::secrets::get(&j.api_key_env).ok_or_else(|| anyhow!("no API key"))?;
     let last: String = messages.last().map(|m| m.content.chars().take(6000).collect()).unwrap_or_default();
+    // Documented shape: POST /v1/systemone {model, state, questions: {id: {type, instructions}}}.
+    let state = match system {
+        Some(s) if !s.is_empty() => format!("System prompt:\n{}\n\nUser request:\n{last}", s.chars().take(1000).collect::<String>()),
+        _ => last,
+    };
     let body = json!({
-        "input": last,
-        "context": {
-            "system": system.map(|s| s.chars().take(1000).collect::<String>()),
-            "turns": messages.len(),
+        "model": j.model,
+        "state": state,
+        "questions": {
+            "complex": {"type": "noul", "instructions": "Is the user request in `state` complex: multi-step, needing careful reasoning, design or code changes across several places? Answer false for simple questions and small tasks."},
+            "needs_plan": {"type": "noul", "instructions": "Would the request in `state` benefit from writing a step-by-step plan before doing the work?"},
+            "risky": {"type": "noul", "instructions": "Could carrying out the request in `state` delete data, overwrite files, or affect a production system?"},
         },
-        "questions": [
-            {"id": "complexity", "type": "choice", "options": ["simple", "complex"]},
-            {"id": "needs_plan", "type": "boolean"},
-            {"id": "risk", "type": "choice", "options": ["low", "high"]},
-        ],
     });
-    let path = if j.path.starts_with('/') { j.path.clone() } else { format!("/{}", j.path) };
+    let path = if j.path == "/v1/decide" { "/v1/systemone".to_string() } else if j.path.starts_with('/') { j.path.clone() } else { format!("/{}", j.path) };
     let mut rb = http
         .post(format!("{}{}", j.base_url.trim_end_matches('/'), path))
         .timeout(Duration::from_millis(j.timeout_ms.max(100)))
@@ -100,10 +101,27 @@ async fn ask(cfg: &Config, http: &reqwest::Client, system: Option<&str>, message
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
-        bail!("HTTP {status}");
+        // The server's own explanation is the fastest way to fix a request-shape mismatch.
+        let detail: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect();
+        bail!("HTTP {status}: {detail}");
     }
     let v: Value = serde_json::from_str(&text).context("invalid JSON")?;
-    interpret(&v, j.min_confidence, fallback)
+    // The response shape is not documented in what we have, so show it when it can't be read.
+    interpret(&v, j.min_confidence, fallback).map_err(|e| {
+        let raw: String = text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(300).collect();
+        anyhow!("{e}; response was: {raw}")
+    })
+}
+
+/// Read a yes/no answer plus how sure it is. Accepts booleans, "yes"/"no", or a 0..1 probability.
+fn truth(val: &Value, conf: f64) -> Option<(bool, f64)> {
+    match val {
+        Value::Number(n) => {
+            let p = n.as_f64()?;
+            Some((p >= 0.5, p.max(1.0 - p)))
+        }
+        other => as_bool(other).map(|b| (b, conf)),
+    }
 }
 
 /// Pull (value, confidence) for a question id out of several plausible shapes.
@@ -116,7 +134,7 @@ fn answer(v: &Value, id: &str) -> Option<(Value, f64)> {
     };
     match &item {
         Value::Object(o) => {
-            let val = ["choice", "value", "answer", "label"].iter().find_map(|k| o.get(*k)).cloned()?;
+            let val = ["choice", "value", "answer", "label", "noul"].iter().find_map(|k| o.get(*k)).or_else(|| ["probability", "score"].iter().find_map(|k| o.get(*k).filter(|x| x.is_number()))).cloned()?;
             let conf = ["confidence", "probability", "score"]
                 .iter()
                 .find_map(|k| o.get(*k).and_then(|x| x.as_f64()))
@@ -147,27 +165,13 @@ fn as_bool(v: &Value) -> Option<bool> {
 fn interpret(v: &Value, min_conf: f64, fb: &Verdict) -> Result<Verdict> {
     let mut used = 0;
     let mut out = Verdict { source: "jev", note: String::new(), ..fb.clone() };
-    if let Some((val, c)) = answer(v, "complexity") {
-        if c >= min_conf {
-            if let Some(s) = val.as_str() {
-                out.complex = s.eq_ignore_ascii_case("complex");
-                used += 1;
-            }
-        }
-    }
-    if let Some((val, c)) = answer(v, "needs_plan") {
-        if c >= min_conf {
-            if let Some(b) = as_bool(&val) {
-                out.needs_plan = b;
-                used += 1;
-            }
-        }
-    }
-    if let Some((val, c)) = answer(v, "risk") {
-        if c >= min_conf {
-            if let Some(s) = val.as_str() {
-                out.risky = s.eq_ignore_ascii_case("high");
-                used += 1;
+    for (id, slot) in [("complex", &mut out.complex), ("needs_plan", &mut out.needs_plan), ("risky", &mut out.risky)] {
+        if let Some((val, c)) = answer(v, id) {
+            if let Some((b, c)) = truth(&val, c) {
+                if c >= min_conf {
+                    *slot = b;
+                    used += 1;
+                }
             }
         }
     }
@@ -191,9 +195,9 @@ mod tests {
     #[test]
     fn parses_object_shape_with_probabilities() {
         let v = json!({"answers": {
-            "complexity": {"choice": "complex", "probabilities": {"simple": 0.1, "complex": 0.9}},
+            "complex": {"value": true, "confidence": 0.9},
             "needs_plan": {"value": true, "probability": 0.8},
-            "risk": "high"
+            "risky": "yes"
         }});
         let r = interpret(&v, 0.6, &fb()).unwrap();
         assert!(r.complex && r.needs_plan && r.risky);
@@ -201,10 +205,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_real_systemone_response() {
+        let v = json!({"model": "jev-1.14.0", "answers": {
+            "complex": {"type": "noul", "noul": 0.04},
+            "needs_plan": {"type": "noul", "noul": 0.2},
+            "risky": {"type": "noul", "noul": 0.93}
+        }, "usage": {"input_tokens": 361, "output_tokens": 54}});
+        let r = interpret(&v, 0.6, &fb()).unwrap();
+        assert_eq!(r.source, "jev");
+        assert!(!r.complex && !r.needs_plan && r.risky);
+    }
+
+    #[test]
+    fn parses_bare_probabilities() {
+        let v = json!({"complex": 0.92, "needs_plan": {"probability": 0.1}, "risky": 0.55});
+        let r = interpret(&v, 0.6, &fb()).unwrap();
+        assert!(r.complex && !r.needs_plan);
+        assert!(!r.risky, "0.55 is below the confidence floor, so the heuristic value stays");
+    }
+
+    #[test]
     fn parses_array_shape_and_ignores_low_confidence() {
         let v = json!({"results": [
-            {"id": "complexity", "value": "complex", "confidence": 0.3},
-            {"id": "risk", "value": "high", "confidence": 0.95}
+            {"id": "complex", "value": true, "confidence": 0.3},
+            {"id": "risky", "value": true, "confidence": 0.95}
         ]});
         let r = interpret(&v, 0.6, &fb()).unwrap();
         assert!(!r.complex, "low-confidence answer must fall back to the heuristic value");

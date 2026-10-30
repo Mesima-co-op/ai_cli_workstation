@@ -2,6 +2,7 @@ mod check;
 mod config;
 mod engine;
 mod jev;
+mod project;
 mod provider;
 mod router;
 mod secrets;
@@ -53,6 +54,14 @@ enum Cmd {
         model: Option<String>,
         #[arg(short, long)]
         system: Option<String>,
+        /// Work inside a project scope (see `aiws project`); "none" ignores the default project
+        #[arg(short = 'P', long)]
+        project: Option<String>,
+    },
+    /// Folders the AI may work in or read, with safety rules (branches, no merge/delete, no secrets)
+    Project {
+        #[command(subcommand)]
+        action: ProjectCmd,
     },
     /// Usage and spend summary
     Stats {
@@ -90,6 +99,31 @@ enum Cmd {
     Check,
     /// How to connect Hermes Agent, plus a connection check
     Hermes,
+}
+
+#[derive(Subcommand)]
+enum ProjectCmd {
+    /// Create or update a project: `aiws project add myapp C:\code\myapp --context C:\code\shared-lib`
+    Add {
+        name: String,
+        /// Folders the AI may change; the first is the working directory
+        #[arg(required = true)]
+        folders: Vec<PathBuf>,
+        /// Read-only folders for extra context (repeatable)
+        #[arg(short, long)]
+        context: Vec<PathBuf>,
+        /// Make this the project used when none is named
+        #[arg(long)]
+        default: bool,
+    },
+    /// List projects
+    List,
+    /// Show a project's folders, branch state and the rules that will be enforced
+    Show { name: String },
+    /// Choose the project used by default ("off" to clear)
+    Use { name: String },
+    /// Remove a project (never touches the folders)
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -203,7 +237,76 @@ async fn run() -> Result<()> {
             server::serve(Engine::new(path)?, bind.clone()).await?;
         }
         Cmd::Tui { tab } => tui::run(make_source(&cli)?, tab.clone()).await?,
-        Cmd::Chat { prompt, provider, model, system } => {
+        Cmd::Project { action } => {
+            let path = cli.config.clone().unwrap_or_else(config::default_config_path);
+            let mut cfg = config::load(&path)?;
+            match action {
+                ProjectCmd::Add { name, folders, context, default } => {
+                    let abs = |p: &PathBuf| -> Result<String> {
+                        let a = std::path::absolute(p)?;
+                        if !a.is_dir() {
+                            bail!("not a folder: {}", a.display());
+                        }
+                        Ok(a.display().to_string())
+                    };
+                    let entry = cfg.projects.entry(name.clone()).or_default();
+                    entry.folders = folders.iter().map(abs).collect::<Result<_>>()?;
+                    entry.context = context.iter().map(abs).collect::<Result<_>>()?;
+                    if *default {
+                        cfg.default_project = name.clone();
+                    }
+                    config::save(&path, &cfg)?;
+                    println!("Saved project '{name}'. Check it with `aiws project show {name}`; use it with `aiws chat -P {name} \"...\"`.");
+                    if !*default {
+                        println!("Make it the default with `aiws project use {name}`.");
+                    }
+                }
+                ProjectCmd::List => {
+                    if cfg.projects.is_empty() {
+                        println!("No projects yet. Add one: aiws project add myapp <folder> [--context <folder>]");
+                    }
+                    for (n, p) in &cfg.projects {
+                        let mark = if *n == cfg.default_project { " (default)" } else { "" };
+                        println!("{n}{mark}\n  work:    {}\n  context: {}", p.folders.join(", "), if p.context.is_empty() { "-".into() } else { p.context.join(", ") });
+                    }
+                }
+                ProjectCmd::Show { name } => {
+                    let p = cfg.projects.get(name).ok_or_else(|| anyhow::anyhow!("no project '{name}'"))?;
+                    println!("Project {name}");
+                    println!("  may change : {}", p.folders.join(", "));
+                    println!("  read only  : {}", if p.context.is_empty() { "-".into() } else { p.context.join(", ") });
+                    println!("  branch     : {}", if p.create_branch { format!("new '{}...' branch before changes", p.branch_prefix) } else { "current branch".into() });
+                    println!("  on secret  : {}", p.on_secret);
+                    println!("  never read/edit: {}", p.protect.join(", "));
+                    println!("  denied tools:");
+                    for r in project::deny_rules(p) {
+                        println!("    {r}");
+                    }
+                    println!("  folder check:");
+                    for f in p.folders.iter().chain(p.context.iter()) {
+                        let ok = std::path::Path::new(f).is_dir();
+                        println!("    [{}] {f}", if ok { "ok" } else { "--" });
+                    }
+                    println!("Limits are enforced for Claude Code only; Hermes is not used as executor while a project is active.");
+                }
+                ProjectCmd::Use { name } => {
+                    cfg.default_project = if name == "off" { String::new() } else { name.clone() };
+                    config::save(&path, &cfg)?;
+                    println!("Default project: {}", if name == "off" { "(none)" } else { name });
+                }
+                ProjectCmd::Rm { name } => {
+                    if cfg.projects.remove(name).is_none() {
+                        bail!("no project '{name}'");
+                    }
+                    if cfg.default_project == *name {
+                        cfg.default_project.clear();
+                    }
+                    config::save(&path, &cfg)?;
+                    println!("Removed project '{name}' (folders untouched).");
+                }
+            }
+        }
+        Cmd::Chat { prompt, provider, model, system, project } => {
             let mut text = prompt.join(" ");
             if text.trim().is_empty() && !std::io::stdin().is_terminal() {
                 std::io::stdin().read_to_string(&mut text)?;
@@ -219,6 +322,7 @@ async fn run() -> Result<()> {
                 model: model.clone(),
                 max_tokens: None,
                 source: Some("cli".into()),
+                project: project.clone(),
                 stream: false,
                 note: None,
             };
