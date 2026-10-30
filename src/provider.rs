@@ -149,8 +149,28 @@ impl Provider for JevOnly {
         } else {
             asked
         };
-        let questions: serde_json::Map<String, Value> =
-            qs.iter().map(|(id, q)| (id.clone(), json!({"type": "noul", "instructions": q}))).collect();
+        // "What color is the car? [red|blue|green]" becomes a choice question; otherwise yes/no.
+        let parsed: Vec<(String, String, Option<Vec<(String, Option<String>)>>)> = qs
+            .iter()
+            .map(|(id, q)| {
+                let (text, opts) = split_options(q);
+                (id.clone(), text, opts)
+            })
+            .collect();
+        let questions: serde_json::Map<String, Value> = parsed
+            .iter()
+            .map(|(id, text, opts)| {
+                let body = match opts {
+                    Some(o) => json!({
+                        "type": "choice",
+                        "instructions": text,
+                        "criteria": o.iter().map(|(n, d)| (n.clone(), d.clone().map(Value::String).unwrap_or(Value::Null))).collect::<serde_json::Map<String, Value>>(),
+                    }),
+                    None => json!({"type": "noul", "instructions": text}),
+                };
+                (id.clone(), body)
+            })
+            .collect();
         ctx.emit(StreamEvent::Status { text: format!("asking Jev {} question(s)", qs.len()) });
         let model = if req.model.is_empty() { "jev-latest" } else { req.model.as_str() };
         let resp = self
@@ -163,22 +183,34 @@ impl Provider for JevOnly {
             .context("could not reach Jev")?;
         let v = check(resp).await?;
         let answers = v.get("answers").and_then(|a| a.as_object()).ok_or_else(|| anyhow!("Jev returned no answers: {}", clip(&v.to_string(), 300)))?;
-        let mut out = format!("Jev ({}) probability of yes:\n", v.get("model").and_then(|m| m.as_str()).unwrap_or(model));
-        for (id, q) in &qs {
-            let p = answers.get(id).and_then(|a| a.get("noul")).and_then(|n| n.as_f64());
-            match p {
-                Some(p) => {
-                    let filled = (p * 20.0).round() as usize;
-                    out.push_str(&format!(
-                        "  [{}{}] {:>3.0}%  {}  ({})\n",
-                        "#".repeat(filled),
-                        "-".repeat(20 - filled.min(20)),
-                        p * 100.0,
-                        if p >= 0.5 { "yes" } else { "no " },
-                        q
-                    ));
+        let mut out = format!("Jev ({}):\n", v.get("model").and_then(|m| m.as_str()).unwrap_or(model));
+        let bar = |p: f64| {
+            let filled = ((p * 20.0).round() as usize).min(20);
+            format!("[{}{}] {:>3.0}%", "#".repeat(filled), "-".repeat(20 - filled), p * 100.0)
+        };
+        for (id, text, opts) in &parsed {
+            let a = answers.get(id);
+            match opts {
+                None => match a.and_then(|a| a.get("noul")).and_then(|n| n.as_f64()) {
+                    Some(p) => out.push_str(&format!("  {}  {}  ({text})\n", bar(p), if p >= 0.5 { "yes" } else { "no " })),
+                    None => out.push_str(&format!("  (no answer for {id})\n")),
+                },
+                Some(_) => {
+                    out.push_str(&format!("  {text}\n"));
+                    let best = a.and_then(|a| a.get("choice")).and_then(|c| c.as_str()).unwrap_or("");
+                    let mut probs: Vec<(String, f64)> = a
+                        .and_then(|a| a.get("probabilities"))
+                        .and_then(|p| p.as_object())
+                        .map(|m| m.iter().filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f))).collect())
+                        .unwrap_or_default();
+                    probs.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+                    if probs.is_empty() && best.is_empty() {
+                        out.push_str("    (no answer)\n");
+                    }
+                    for (name, p) in probs {
+                        out.push_str(&format!("    {} {}  {name}\n", if name == best { ">" } else { " " }, bar(p)));
+                    }
                 }
-                None => out.push_str(&format!("  (no answer for {id})\n")),
             }
         }
         let usage = v.get("usage");
@@ -191,6 +223,49 @@ impl Provider for JevOnly {
             reported_cost: None,
             billing: "api",
         })
+    }
+}
+
+/// "What color? [red|blue: a blue thing|green]" -> ("What color?", options with optional descriptions).
+/// No trailing `[...]` with at least two options means a plain yes/no question.
+fn split_options(q: &str) -> (String, Option<Vec<(String, Option<String>)>>) {
+    let q = q.trim();
+    if let (true, Some(open)) = (q.ends_with(']'), q.rfind('[')) {
+        let opts: Vec<(String, Option<String>)> = q[open + 1..q.len() - 1]
+            .split('|')
+            .filter_map(|o| {
+                let (name, desc) = match o.split_once(':') {
+                    Some((n, d)) => (n.trim(), Some(d.trim().to_string()).filter(|d| !d.is_empty())),
+                    None => (o.trim(), None),
+                };
+                (!name.is_empty()).then(|| (name.to_string(), desc))
+            })
+            .collect();
+        if opts.len() >= 2 {
+            return (q[..open].trim().to_string(), Some(opts));
+        }
+    }
+    (q.to_string(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_options;
+
+    #[test]
+    fn brackets_make_a_choice_question() {
+        let (t, o) = split_options("What color is the car? [red|blue: the sky color|green]");
+        assert_eq!(t, "What color is the car?");
+        let o = o.unwrap();
+        assert_eq!(o.len(), 3);
+        assert_eq!(o[1], ("blue".to_string(), Some("the sky color".to_string())));
+        assert_eq!(o[0].1, None);
+    }
+
+    #[test]
+    fn no_brackets_or_one_option_stays_yes_no() {
+        assert!(split_options("Is it urgent?").1.is_none());
+        assert!(split_options("Is it urgent? [maybe]").1.is_none());
     }
 }
 
